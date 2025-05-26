@@ -40,8 +40,164 @@ This interface has an `Accept` method that takes a `Visitor` parameter. Subseque
 
 For example, [plan.preprocess](https://github.com/pingcap/tidb/blob/source-code/plan/preprocess.go) performs `AST` pre-processing, including legality checks and name binding.
 
-## Author Introduction
+### Lexical Analysis Implementation
+The SQL parsing process in TiDB happens in two main stages:
+- Lexical Analysis (Lexer) - Converts SQL text into tokens
+- Syntactic Analysis (Parser) - Converts tokens into an AST
 
-Ma Zhen is an architect at Jinyi Tianyan, who was previously responsible for middleware and big data platform development. He has recently moved into the NewSQL field, focusing on OLTP/AP integration, and is currently promoting the adoption of TiDB as a database storage service for the next generation of Jinyi.
+#### Scanner Implementation
+The core of lexical analysis is implemented in the `Scanner` struct in `lexer.go`:
 
-Click to see more [TiDB source code reading series articles](https://cn.pingcap.com/blog/tag/tidb-source-code-reading/) 
+```go
+type Scanner struct {
+    r   reader              // Reads input SQL text
+    buf bytes.Buffer        // Buffers token construction
+    errs         []error    // Stores scanning errors
+    sqlMode mysql.SQLMode   // SQL mode affects lexing behavior
+    lastScanOffset int      // Tracks last scan position
+}
+```
+
+The scanner uses a character-by-character reading approach with the following key functions:
+
+1. **Main Scanning Function**:
+```go
+func (s *Scanner) scan() (tok int, pos Pos, lit string) {
+    // Skip whitespace
+    ch0 := s.skipWhitespace()
+    
+    // Handle identifiers
+    if isIdentExtend(ch0) {
+        return scanIdentifier(s)
+    }
+    
+    // Handle operators and keywords using trie
+    node := &ruleTable
+    for ch0 >= 0 && ch0 <= 255 {
+        if node.childs[ch0] == nil {
+            break
+        }
+        node = node.childs[ch0]
+        if node.fn != nil {
+            return node.fn(s)
+        }
+        s.r.inc()
+        ch0 = s.r.peek()
+    }
+    
+    return node.token, pos, s.r.data(&pos)
+}
+```
+
+#### Token Recognition System
+TiDB implements an efficient token recognition system using a trie data structure:
+
+```go
+type trieNode struct {
+    childs [256]*trieNode  // Child nodes for each character
+    token  int             // Token type if this is a terminal node  
+    fn     func(s *Scanner) (int, Pos, string) // Custom scanner function
+}
+```
+
+The trie is initialized with both single-character and multi-character tokens:
+```go
+func init() {
+    // Single character tokens
+    initTokenByte('*', int('*'))
+    initTokenByte('/', int('/'))
+    
+    // Multi-character tokens
+    initTokenString("||", pipes)
+    initTokenString("&&", andand)
+    initTokenString(":=", assignmentEq)
+}
+```
+
+#### Parser Implementation
+The parser is generated from `parser.y` using goyacc and is structured around the `Parser` struct:
+
+```go
+type Parser struct {
+    charset   string
+    collation string
+    result    []ast.StmtNode  // Parsed AST nodes
+    src       string          // Source SQL
+    lexer     Scanner         // Lexical analyzer
+    cache     []yySymType     // Parser cache
+}
+```
+
+#### Abstract Syntax Tree (AST)
+The AST system is built on a set of interfaces defined in `ast/ast.go`:
+
+```go
+type Node interface {
+    Accept(v Visitor) (node Node, ok bool)
+    Text() string
+    SetText(text string)
+}
+
+type ExprNode interface {
+    Node
+    SetType(tp *types.FieldType)
+    GetType() *types.FieldType)
+    SetFlag(flag uint64)
+    GetFlag() uint64
+}
+```
+
+#### Complete Parsing Process
+The parsing process combines all these components:
+
+```go
+func (parser *Parser) Parse(sql, charset, collation string) ([]ast.StmtNode, []error, error) {
+    // Setup parser state
+    parser.src = sql
+    parser.result = parser.result[:0]
+    
+    // Create lexer and parse
+    parser.lexer.reset(sql)
+    yyParse(&parser.lexer, parser)
+    
+    // Handle errors and warnings
+    warns, errs := parser.lexer.Errors()
+    
+    // Post-process AST
+    for _, stmt := range parser.result {
+        ast.SetFlag(stmt)
+    }
+    
+    return parser.result, warns, nil
+}
+```
+
+#### Example Flow
+For a SQL query like `SELECT id FROM users WHERE age > 18`, the process works as follows:
+
+1. **Lexical Analysis** breaks it into tokens:
+   - `SELECT` (keyword token)
+   - `id` (identifier token)
+   - `FROM` (keyword token)
+   - `users` (identifier token)
+   - `WHERE` (keyword token)
+   - `age` (identifier token)
+   - `>` (operator token)
+   - `18` (number token)
+
+2. **Parsing** builds an AST structure:
+```go
+SelectStmt {
+    Fields: []*FieldList{id},
+    From: &TableRefsClause{users},
+    Where: &BinaryOpExpr{
+        Left: &ColumnNameExpr{age},
+        Op: '>',
+        Right: &ValueExpr{18}
+    }
+}
+```
+
+This implementation allows TiDB to efficiently parse SQL statements while maintaining compatibility with MySQL syntax and providing detailed error information when needed. The handwritten lexer provides performance benefits, while the generated parser ensures correct grammar handling according to the rules defined in parser.y.
+
+
